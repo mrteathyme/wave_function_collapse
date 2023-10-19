@@ -1,516 +1,286 @@
-#![allow(unused_variables)]
-use std::ops::Add;
-use std::rc::Rc;
-
+use wave_function_collapse::*;
 use std::collections::HashMap;
+use std::ops::Add;
 
-use rand::distributions::WeightedIndex;
-use rand::prelude::*;
-use rand::thread_rng;
+use std::time::Instant;
 
 use bmp_rust::bmp::BMP;
 
+use std::fs;
+use toml::Table;
+use serde::{Serialize,Deserialize};
+
+
 const DIRECTIONS: [Position; 8] = [
-    Position(-1, 1, 0),
-    Position(0, 1, 0),
-    Position(1, 1, 0),
-    Position(-1, 0, 0),
-    Position(1, 0, 0),
-    Position(-1, -1, 0),
-    Position(0, -1, 0),
-    Position(1, -1, 0),
+    Position{x:-1,y:1,z:0},
+    Position{x:0,y:1,z:0},
+    Position{x:1,y:1,z:0},
+    Position{x:-1,y:0,z:0},
+    Position{x:1,y: 0,z:0},
+    Position{x:-1,y:-1,z:0},
+    Position{x:0,y:-1,z:0},
+    Position{x:1,y:-1,z:0},
 ];
 
-//static DIRECTIONS: [Position;4] = [Position(-1,0,0), Position(0,1,0), Position(1,0,0), Position(0,-1,0)];
+static RESOLUTION: (i32, i32) = (3440, 1440);
 
-static RESOLUTION: (i32, i32) = (1280, 720);
 
-fn main() {
-    let mut rng = thread_rng();
-    let mut tile_atlas: HashMap<Position, Rc<Tile<{ DIRECTIONS.len() }>>> = HashMap::new();
-    let mut pending_tiles: HashMap<Position, Rc<Tile<{ DIRECTIONS.len() }>>> = HashMap::new();
-    for x in 0..(RESOLUTION.0/10) {
-        for y in 0..(RESOLUTION.1/10) {
-            let tile = Rc::new(Tile::new(Position(x, y, 0)));
-            tile_atlas.insert(Position(x, y, 0), tile);
+
+fn collapse_tiles(node_system: &mut NodeSystem<TileNode>, pass_counter: i32) -> i32 {
+    let mut invalid_tiles = 0;
+    println!("Beginning Pass {pass_counter}");
+    let timestamp = Instant::now();
+    while let Some(collapsed_node) = node_system.next() {
+        if collapsed_node.get_node_type() == TileType::Invalid {invalid_tiles+=1}
+        for position in collapsed_node.get_connecting_nodes() {
+            node_system.add_node_to_queue(&position.clone());
         }
     }
-    let mut lowest_tile = tile_atlas.get(&Position(rng.gen_range(0..(RESOLUTION.0/10)), rng.gen_range(0..(RESOLUTION.1/10)), 0)).unwrap().as_ref().clone();
-    pending_tiles.insert(lowest_tile.position, Rc::new(lowest_tile.clone()));
-    let mut iterations = 0;
-    //Appeasing the compiler gods below lol
-    //let mut lowest_tile: Tile<{ DIRECTIONS.len() }> = pending_tiles.get(&Position(rng.gen_range(0..(RESOLUTION.0/10)), rng.gen_range(0..(RESOLUTION.1/10)), 0)).unwrap().as_ref().clone();
-    let mut previous_tile: Tile<{ DIRECTIONS.len() }> = Tile::new(Position(0, 0, -1));
-    while pending_tiles.len() > 0 {
-        let mut lowest_entropy = f32::MAX;
-        for tile in pending_tiles.iter_mut() {
-            if tile.1.get_entropy(&tile_atlas) <= lowest_entropy {
-                lowest_entropy = tile.1.get_entropy(&tile_atlas);
-                lowest_tile = tile.1.as_ref().clone();
-            }
+    let elapsed = timestamp.elapsed().as_micros();
+    let seconds = elapsed as f32 / 1000000.0;
+    let node_count = (RESOLUTION.0/10)*(RESOLUTION.1/10);
+    let nodes_per_second = node_count as f32 / ((elapsed as f32) /1000000.0);
+    println!("Finished collapsing {node_count} nodes in {seconds} seconds: {nodes_per_second} nodes per second, Spawned {invalid_tiles} invalid nodes");
+    println!("Scanning for additional invalid nodes");
+    for (position, node) in node_system.get_atlas() {
+        if node.get_node_type() == TileType::Invalid {
+                for connecting_node in node.get_connecting_nodes() {
+                    node_system.reset_node(&connecting_node);
+                    invalid_tiles += 1;
+                }
+            node_system.reset_node(&position);
+            invalid_tiles +=1;
+            continue
         }
-        if lowest_tile == previous_tile {
-            break;
+        if node.get_node_type().can_spawn(node_system.get_connecting_node_types(&node.get_connecting_nodes())) == false {
+            invalid_tiles += 1;
+            node_system.reset_node(&position);
         }
-        lowest_tile.collapse(&mut tile_atlas, &mut pending_tiles);
-        pending_tiles.remove(&lowest_tile.position);
-        println!(
-            "iteration: {iterations}, collapsed tile at position {:?}, result of collapse: {:?}",
-            lowest_tile.position, lowest_tile.tile_type
-        );
+    }
+    println!("Reset {invalid_tiles} nodes");
+    invalid_tiles
+}
 
-        tile_atlas.insert(lowest_tile.position, Rc::new(lowest_tile.clone()));
-        previous_tile = lowest_tile.clone();
-        iterations += 1;
+fn main() {
+    set_max_threads(24);
+    set_chunk_limit(50000);
+    let mut node_system: NodeSystem<TileNode> = NodeSystem::new();
+    let cache_toml: HashMap<Box<str>, bool> = toml::from_str(&fs::read_to_string("cache.toml").unwrap()).unwrap(); //(fs::read("cache.toml").unwrap()).unwrap();
+    node_system.set_cache(cache_toml);
+    for x in 0..(RESOLUTION.0/10) {
+        for y in 0..(RESOLUTION.1/10) {
+            node_system.add_node_to_atlas(&Position {x,y,z:0});
+        }
+    }
+    
+    let mut invalid_tiles = 1;
+    let mut pass_counter = 1;
+    while invalid_tiles > 0 {
+        invalid_tiles = collapse_tiles(&mut node_system, pass_counter);
+        pass_counter += 1;
     }
 
     let mut img = BMP::new(RESOLUTION.1, RESOLUTION.0 as u32, None);
     for x in 0..(RESOLUTION.0/10) {
         for y in 0..(RESOLUTION.1/10) {
-            let color: [u8; 4] = match tile_atlas.get(&Position(x, y, 0)).unwrap().tile_type {
-                TileType::Grass => [0, 255, 0, 255],
-                TileType::Water => [0, 179, 255, 255],
-                TileType::DeepWater => [0,0,255,255],
-                TileType::BigTree => [21,76,0,255],
-                TileType::Sand => [255, 255, 0, 255],
-                TileType::Tree => [92, 108, 0, 255],
-                TileType::House => [245, 40, 145, 255],
-                _ => [0, 0, 0, 255],
-            };
-            let _ = img.draw_rectangle(
-                Some(color),
-                Some(color),
-                [(x * 10) as u16, (y * 10) as u16],
-                [((x + 1) * 10 - 1) as u16, ((y + 1) * 10 - 1) as u16],
-            );
+            let color: [u8; 4] = match node_system.get_node(&Position{x, y, z:0}).get_node_type() {
+                    TileType::Grass => [0, 255, 0, 255],
+                    TileType::Water => [0, 179, 255, 255],
+                    TileType::DeepWater => [0,0,255,255],
+                    //TileType::BigTree => [21,76,0,255],
+                    TileType::Sand => [255, 255, 0, 255],
+                    TileType::Tree => [92, 108, 0, 255],
+                    //TileType::House => [245, 40, 145, 255],
+                    _ => [0, 0, 0, 255],
+                };
+                let _ = img.draw_rectangle(
+                    Some(color),
+                    Some(color),
+                    [(x * 10) as u16, (y * 10) as u16],
+                    [((x + 1) * 10 - 1) as u16, ((y + 1) * 10 - 1) as u16],
+                );
+            }
         }
-    }
     let _ = img.save_to_new("img.bmp");
+    let cache_toml = toml::to_string(&node_system.get_cache()).unwrap(); 
+    fs::write("cache.toml", cache_toml).unwrap();
 }
 
-#[derive(Clone, Copy, Hash, Eq, PartialEq, Debug)]
-struct Position(i32, i32, i32);
+
+impl Node for TileNode {
+    type PositionType = Position;
+    type NodeVariants = TileType;
+
+    fn new(position: &Position) -> Self {
+        let mut connecting_nodes = vec![];
+        for direction in DIRECTIONS {
+            connecting_nodes.push(*position + direction);
+        }
+        Self {
+            tile_type: TileType::None,
+            position: position.clone(),
+            connecting_nodes,
+            collapsed:false
+        }
+    }
+    fn get_atlas_position(&self) -> Self::PositionType {
+        self.position
+    }
+    fn get_node_type(&self) -> Self::NodeVariants {
+        self.tile_type
+    }
+    fn set_node_type(&mut self, node_type: Self::NodeVariants) {
+        self.tile_type = node_type
+    }
+    fn get_default_type() -> Self::NodeVariants {
+        Self::NodeVariants::None
+    }
+    fn get_connecting_nodes(&self) -> Vec<Self::PositionType> {
+        self.connecting_nodes.clone()
+    }
+    fn get_domain_weights(&self) -> HashMap<Self::NodeVariants, f32> {
+        Self::NodeVariants::get_domain_weights()
+    }
+    fn has_collapsed(&self) -> bool {
+        self.collapsed
+    }
+    fn set_collapsed(&mut self, state: bool) {
+        self.collapsed = state;
+    }
+}
+
+
+
+#[derive(Clone, Debug)]
+struct TileNode {
+    tile_type: TileType,
+    position: Position,
+    connecting_nodes: Vec<Position>,
+    collapsed: bool
+}
+
+#[derive(Clone, Copy, Eq, PartialEq, Hash, Debug, Default)]
+struct Position { x: i32, y: i32, z: i32 }
 
 impl Add for Position {
     type Output = Self;
     fn add(self, other: Self) -> Self {
         Self {
-            0: self.0 + other.0,
-            1: self.1 + other.1,
-            2: self.2 + other.2,
+            x: self.x + other.x, 
+            y: self.y + other.y, 
+            z: self.z + other.z,
         }
     }
 }
 
-#[derive(Clone, Debug, PartialEq)]
-struct Tile<const DOMAINSIZE: usize> {
-    tile_type: TileType,
-    position: Position,
-    connecting_tiles: [Option<Rc<Self>>; DOMAINSIZE],
-}
 
-impl<const DOMAINSIZE: usize> Tile<DOMAINSIZE> {
-    fn new(position: Position) -> Tile<DOMAINSIZE> {
-        Tile {
-            tile_type: TileType::None,
-            position,
-            connecting_tiles: std::array::from_fn(|_| None)
-        }
-    }
-
-    fn collapse(
-        &mut self,
-        tile_atlas: &mut HashMap<Position, Rc<Tile<DOMAINSIZE>>>,
-        pending_tiles: &mut HashMap<Position, Rc<Tile<DOMAINSIZE>>>,
-    ) {
-        self.update_connecting_tiles(tile_atlas);
-        let mut choices = vec![];
-        let mut weights = vec![];
-        for (key, value) in self.get_domain_weights(tile_atlas) {
-            if value > 0.0 {
-                choices.push(key);
-                weights.push(value);
-            }
-        }
-        if weights.len() == 0 {
-            self.tile_type = TileType::Invalid;
-            return;
-        }
-        let dist = WeightedIndex::new(&weights).unwrap();
-        let mut rng = thread_rng();
-        self.tile_type = choices[dist.sample(&mut rng)];
-        let temp_atlas = tile_atlas.clone();
-        for (i, _) in self.connecting_tiles.clone().into_iter().enumerate() {
-            let real_tile = tile_atlas.get_mut(&(self.position + DIRECTIONS[i]));
-            if let Some(tile_inner) = real_tile {
-                if tile_inner.tile_type == TileType::None {
-                    let mut tile_clone = tile_inner.as_ref().clone();
-                    tile_clone.update_connecting_tiles(&temp_atlas);
-                    pending_tiles.insert(tile_inner.position, Rc::new(tile_clone));
-                }
-            }
-        }
-    }
-
-    fn update_connecting_tiles(&mut self, tile_atlas: &HashMap<Position, Rc<Tile<DOMAINSIZE>>>) {
-        for (i, direction) in DIRECTIONS.into_iter().enumerate() {
-            self.connecting_tiles[i] = match tile_atlas.get(&(direction + self.position)) {
-                Some(tile) => Some(tile.clone()),
-                None => None,
-            };
-        }
-    }
-
-    fn get_domain_weights(
-        &self,
-        tile_atlas: &HashMap<Position, Rc<Tile<DOMAINSIZE>>>,
-    ) -> HashMap<TileType, f32> {
-        let mut weights = TileType::init_domain_weights();
-        //let real_tiles: Rc<[Self]> = self.connecting_tiles.clone().into_iter().filter(|&value| value != &None).map(|value| value.unwrap()).collect();
-        for (tile, weight) in weights.clone() {
-            if tile.can_spawn(&self.connecting_tiles, tile_atlas, 0, self) == false {
-                weights.insert(tile, 0.0);
-                continue;
-            }
-            weights.insert(tile, weight * tile.get_weighting_multiplier(&self.connecting_tiles, tile_atlas));
-        }
-        weights
-    }
-
-    fn get_entropy(&self, tile_atlas: &HashMap<Position, Rc<Tile<DOMAINSIZE>>>) -> f32 {
-        let mut weighting_sum: f32 = 0.0;
-        let mut log_weights_sum: f32 = 0.0;
-        for (_, weight) in self.get_domain_weights(tile_atlas) {
-            if weight > 0.0 {
-                weighting_sum += weight;
-                log_weights_sum += weight * weight.log2();
-            }
-        }
-        if weighting_sum == 0.0 {return f32::MAX};
-        weighting_sum.log2() - (log_weights_sum / weighting_sum)
-    }
-}
-
-#[derive(Clone, Debug, Hash, Eq, PartialEq, Copy)]
+#[derive(Clone, Copy, Eq, PartialEq, Debug, Hash, Serialize, Deserialize)]
 enum TileType {
-    Grass,
-    Water,
-    Sand,
-    Tree,
-    House,
-    DeepWater,
-    BigTree,
     None,
     Invalid,
+    Sand,
+    Grass,
+    Water,
+    Tree,
+    DeepWater,
+    //DeeperWater,
+    //BigTree,
 }
 
-trait TileVariant<const DOMAINSIZE: usize> {
-    const DOMAIN: [TileType; DOMAINSIZE];
-    const VARIANT: TileType;
-
-    fn neighbour_ok(tile_type: TileType) -> bool {
-        if Self::DOMAIN.contains(&tile_type) {return true;}
-        false
+impl NodeVariants for TileType { 
+    fn get_domain() -> Vec<Self> {
+        vec![Self::Sand, Self::Grass, Self::Water, Self::DeepWater, Self::Tree]
     }
-
-    fn inverted_spawn<const TILENUM: usize>(
-        proposed_tile_type: TileType,
-        position: Position,
-        atlas: &HashMap<Position, Rc<Tile<TILENUM>>>,
-        new_center: Tile<TILENUM>
-    ) -> bool {
-        let mut rebuilt_tiles: [Option<Rc<Tile<TILENUM>>>; TILENUM] = std::array::from_fn(|_| None);
-        let iterations = 0;
-        for tile in new_center.connecting_tiles.clone() {
-            match tile {
-                Some(tile_inner) => {
-                   let tile_type = if tile_inner.position == position {proposed_tile_type} else {tile_inner.tile_type};
-                   rebuilt_tiles[iterations] = Some(Rc::new(Tile {position: tile_inner.position, tile_type, connecting_tiles: tile_inner.connecting_tiles.clone()}));  
-                },
-                None => continue
-            }
-        }
-        proposed_tile_type.can_spawn(&rebuilt_tiles, atlas, 0, &new_center)
-    }
-
-    fn can_spawn<const TILENUM: usize>(
-        connecting_tiles: &[Option<Rc<Tile<TILENUM>>>],
-        atlas: &HashMap<Position, Rc<Tile<TILENUM>>>,
-        recursion_level: i32,
-        center: &Tile<TILENUM>
-    ) -> bool {
-        for tile in connecting_tiles {
-            match tile {
-                Some(tile_inner) => {
-                    if tile_inner.tile_type.neighbour_ok(Self::VARIANT) == false
-                    {
-                        return false;
-                    }
-                    if tile_inner.tile_type.inverted_spawn(Self::VARIANT, center.position,atlas,  tile_inner.as_ref().clone()) == false { return false; }
-                    //if tile_inner.tile_type.can_spawn(&[Some(Rc::new(Tile {position: center.position, tile_type: Self::VARIANT, connecting_tiles: center.connecting_tiles.clone()}))], atlas, recursion_level, center) == false { return false};
-                }
-                None => continue,
-            }
-        }
-        true
-    }
-    fn get_weighting_multiplier<const TILENUM: usize>(
-        connecting_tiles: &[Option<Rc<Tile<TILENUM>>>],
-        tile_atlas: &HashMap<Position, Rc<Tile<TILENUM>>>,
-    ) -> f32 {
-        1.0
-    }
-}
-
-struct Grass;
-struct Water;
-struct Sand;
-struct Tree;
-struct House;
-struct DeepWater;
-struct BigTree;
-
-impl TileVariant<4> for BigTree {
-    const DOMAIN: [TileType; 4] = [
-        TileType::Tree,
-        TileType::BigTree,
-        TileType::None,
-        TileType::Invalid
-    ];
-    const VARIANT: TileType = TileType::BigTree;
-
-fn can_spawn<const TILENUM: usize>(
-            connecting_tiles: &[Option<Rc<Tile<TILENUM>>>],
-            atlas: &HashMap<Position, Rc<Tile<TILENUM>>>,
-            recursion_level: i32,
-            center: &Tile<TILENUM>
-        ) -> bool {
-        let mut tree_count = 0;
-        let mut big_tree_count = 0;
-        for tile in connecting_tiles {
-            match tile {
-                Some(tile_inner) => {
-                    if tile_inner.tile_type.neighbour_ok(Self::VARIANT) == false { return false; }
-                    if tile_inner.tile_type.inverted_spawn(Self::VARIANT, center.position,atlas,  tile_inner.as_ref().clone()) == false { return false; }
-                    if tile_inner.tile_type == TileType::Tree {tree_count += 1}
-                    if tile_inner.tile_type == TileType::BigTree {big_tree_count += 1}
-                }
-                None => continue,
-            }
-        }
-        if tree_count < 3 && big_tree_count < 1 {
-            return false
-        }
-        true
-    }
-}
-
-impl TileVariant<4> for DeepWater {
-    const DOMAIN: [TileType; 4] = [
-        TileType::Water,
-        TileType::DeepWater,
-        TileType::None,
-        TileType::Invalid,
-    ];
-    const VARIANT: TileType = TileType::DeepWater;
-
-    fn can_spawn<const TILENUM: usize>(
-            connecting_tiles: &[Option<Rc<Tile<TILENUM>>>],
-            atlas: &HashMap<Position, Rc<Tile<TILENUM>>>,
-            recursion_level: i32,
-            center: &Tile<TILENUM>
-        ) -> bool {
-        let mut water_count = 0;
-        let mut deep_water_count = 0;
-        for tile in connecting_tiles {
-            match tile {
-                Some(tile_inner) => {
-                    if tile_inner.tile_type.neighbour_ok(Self::VARIANT) == false { return false; }
-                    if tile_inner.tile_type.inverted_spawn(Self::VARIANT, center.position,atlas,  tile_inner.as_ref().clone()) == false { return false; }
-                    if tile_inner.tile_type == TileType::Water {water_count += 1}
-                    if tile_inner.tile_type == TileType::DeepWater {deep_water_count += 1}
-                }
-                None => continue,
-            }
-        }
-        if water_count < 3 && deep_water_count < 1 {
-            return false
-        }
-        true
-    }
-}
-
-impl TileVariant<3> for House {
-    const DOMAIN: [TileType; 3] = [TileType::Grass, TileType::None, TileType::Invalid];
-    const VARIANT: TileType = TileType::House;
-}
-
-impl TileVariant<5> for Sand {
-    const DOMAIN: [TileType; 5] = [
-        TileType::Grass,
-        TileType::Sand,
-        TileType::Water,
-        TileType::Invalid,
-        TileType::None,
-    ];
-    const VARIANT: TileType = TileType::Sand;
-
-    fn can_spawn<const TILENUM: usize>(
-        connecting_tiles: &[Option<Rc<Tile<TILENUM>>>],
-        atlas: &HashMap<Position, Rc<Tile<TILENUM>>>,
-        recursion_level: i32,center: &Tile<TILENUM>
-
-    ) -> bool {
-        let mut grass_count = 0;
-        let mut water_count = 0;
-        for tile in connecting_tiles {
-            match tile {
-                Some(tile_inner) => {
-                    if tile_inner.tile_type.neighbour_ok(Self::VARIANT) == false { return false; }
-                    if tile_inner.tile_type.inverted_spawn(Self::VARIANT, center.position,atlas,  tile_inner.as_ref().clone()) == false { return false; }
-                    if tile_inner.tile_type == TileType::Grass {grass_count+=1; if grass_count > 3 {return false}}
-                    if tile_inner.tile_type == TileType::Water {water_count+=1; if water_count > 3 {return false}}
-                    for sub_tile in &tile_inner.connecting_tiles {
-                        match sub_tile {
-                            Some(sub_tile_inner) => {
-                               if tile_inner.tile_type == TileType::Grass && (sub_tile_inner.tile_type == TileType::Water || sub_tile_inner.tile_type == TileType::None) { return true }
-                                if tile_inner.tile_type == TileType::Water && (sub_tile_inner.tile_type == TileType::Grass || sub_tile_inner.tile_type == TileType::None) { return true }
-                                //if tile_inner.tile_type == TileType::Sand && (sub_tile_inner.tile_type == TileType::Water || sub_tile_inner.tile_type == TileType::Sand || sub_tile_inner.tile_type == TileType::Grass || sub_tile_inner.tile_type == TileType::None) {return true}
-                            },
-                            None => continue
-                        }
-                    }
-                }
-                None => continue,
-            }
-        }
-        false
-    }
-
-}
-
-impl TileVariant<5> for Water {
-    const DOMAIN: [TileType; 5] = [
-        TileType::Sand,
-        TileType::Water,
-        TileType::DeepWater,
-        TileType::None,
-        TileType::Invalid,
-    ];
-    const VARIANT: TileType = TileType::Water;
-}
-
-impl TileVariant<6> for Grass {
-    const DOMAIN: [TileType; 6] = [
-        TileType::Grass,
-        TileType::Tree,
-        TileType::House,
-        TileType::Sand,
-        TileType::None,
-        TileType::Invalid,
-    ];
-    const VARIANT: TileType = TileType::Grass;
-}
-
-impl TileVariant<5> for Tree {
-    const DOMAIN: [TileType; 5] = [
-        TileType::Grass,
-        TileType::Tree,
-        TileType::BigTree,
-        TileType::None,
-        TileType::Invalid,
-    ];
-    const VARIANT: TileType = TileType::Tree;
-}
-
-impl TileType {
-    const DEFAULT_DOMAINS: [TileType; 7] = [
-        Self::Grass,
-        Self::Water,
-        Self::Sand,
-        Self::Tree,
-        Self::House,
-        Self::DeepWater,
-        Self::BigTree
-    ];
-
-    fn inverted_spawn<const DOMAINSIZE: usize>(&self, tile_type: Self, position: Position,atlas: &HashMap<Position, Rc<Tile<DOMAINSIZE>>>, center: Tile<DOMAINSIZE>) -> bool {
+   
+    fn get_name(&self) -> Box<str> {
         match self {
-            Self::House => House::inverted_spawn(tile_type, position, atlas, center),
-            Self::Tree => Tree::inverted_spawn(tile_type, position,atlas,  center),
-            Self::Sand => Sand::inverted_spawn(tile_type, position,atlas,  center),
-            Self::Grass => Grass::inverted_spawn(tile_type, position,atlas,  center),
-            Self::Water => Water::inverted_spawn(tile_type, position,atlas,  center),
-            Self::DeepWater => DeepWater::inverted_spawn(tile_type, position,atlas,  center),
-            Self::BigTree => BigTree::inverted_spawn(tile_type, position,atlas,  center),
+        Self::Sand => "Sand".into(),
+        Self::Water => "Water".into(),
+        Self::Grass => "Grass".into(),
+        Self::DeepWater => "DeepWater".into(),
+        Self::Tree => "Tree".into(),
+        Self::Invalid => "Invalid".into(),
+        Self::None => "None".into(),
+    }}
+
+    fn get_weight(&self) -> f32 {
+        match self {
+            Self::Sand => 0.1,
+            Self::Water => 1.0,
+            Self::Grass => 1.0,
+            Self::DeepWater => 0.9,
+            Self::Tree => 0.9,
+            _ => 1.0
+        }
+    }
+    
+    fn get_weighting_multiplier(&self, nodes: &Vec<Self>) -> f32 {
+        match self {
+            //Self::Tree => {
+            //    let mut multiplier = 1.0;
+            //    for node in nodes {
+            //        if node == &Self::Grass {multiplier += 1.0};
+            //        if node == &Self::Tree {multiplier += 1.0};
+            //        if node == &Self::BigTree {multiplier += 1.0};
+            //    }
+            //    multiplier
+            //},
+            //Self::DeepWater => {
+            //    let mut multiplier = 1.0;
+            //    for node in nodes {
+            //        if node == &Self::Water {multiplier += 1.0};
+            //        if node == &Self::DeepWater {multiplier += 1.0};
+            //        if node == &Self::DeeperWater {multiplier += 1.0};
+            //    }
+            //    multiplier 
+            //}
+            _ => 1.0
+        }
+    }
+
+    fn get_invalid_type() -> Self {
+       Self::Invalid 
+    }
+    
+    fn can_spawn(&self, node_types: Vec<Self>) -> bool {
+        match self {    
+            Self::Sand => {
+                let mut grass_count = 0;
+                let mut water_count = 0;
+                for node in node_types {
+                    if node == Self::Grass {grass_count += 1};
+                    if node == Self::Water {water_count += 1};
+                }
+                if grass_count > 5 || water_count > 5 { false } else { true }
+            },
+            Self::Water => {
+                let mut deep_count = 0;
+                for node in node_types {
+                    if node == Self::DeepWater {deep_count += 1};
+                }
+                if deep_count > 5 { false } else { true }
+            },
+            Self::Grass => {
+                let mut tree_count = 0;
+                for node in node_types {
+                    if node == Self::Tree {tree_count += 1};
+                }
+                if tree_count > 5 { false } else { true }
+            }
             _ => true
         }
     }
 
-    fn neighbour_ok(&self, tile_type: TileType) -> bool {
+    fn can_spawn_next_to(&self, node_type: Self) -> bool {
         match self {
-            Self::House => House::neighbour_ok(tile_type),
-            Self::Tree => Tree::neighbour_ok(tile_type),
-            Self::Sand => Sand::neighbour_ok(tile_type),
-            Self::Grass => Grass::neighbour_ok(tile_type),
-            Self::Water => Water::neighbour_ok(tile_type),
-            Self::DeepWater => DeepWater::neighbour_ok(tile_type),
-            Self::BigTree => BigTree::neighbour_ok(tile_type),
-            _ => true,
+            Self::Sand => [Self::Sand, Self::Water, Self::Grass,Self::None, Self::Invalid].contains(&node_type),
+            Self::Grass => [Self::Tree, Self::Grass, Self::Sand,Self::None, Self::Invalid].contains(&node_type),
+            Self::Water => [Self::DeepWater, Self::Water, Self::Sand,Self::None, Self::Invalid].contains(&node_type),
+            Self::DeepWater => [Self::Water, Self::DeepWater, Self::None, Self::Invalid].contains(&node_type),
+            Self::Tree => [Self::Tree, Self::Grass, Self::None, Self::Invalid].contains(&node_type),
+            //Self::BigTree => [Self::BigTree, Self::Tree, Self::None, Self::Invalid].contains(&node_type),
+            //Self::DeeperWater => [Self::DeepWater, Self::Water, Self::None, Self::Invalid].contains(&node_type),
+            _ => true
         }
-
-    }
-
-    fn get_weighting_multiplier<const DOMAINSIZE: usize>(&self, connecting_tiles: &[Option<Rc<Tile<DOMAINSIZE>>>], atlas: &HashMap<Position, Rc<Tile<DOMAINSIZE>>>) -> f32 {
-        match self {
-            Self::House => House::get_weighting_multiplier(connecting_tiles,atlas),
-            Self::Tree => Tree::get_weighting_multiplier(connecting_tiles,atlas),
-            Self::Sand => Sand::get_weighting_multiplier(connecting_tiles,atlas),
-            Self::Grass => Grass::get_weighting_multiplier(connecting_tiles,atlas),
-            Self::Water => Water::get_weighting_multiplier(connecting_tiles,atlas),
-            Self::DeepWater => DeepWater::get_weighting_multiplier(connecting_tiles,atlas),
-            Self::BigTree => BigTree::get_weighting_multiplier(connecting_tiles,atlas),
-            _ => 1.0,
-        }
-    }
-
-    fn can_spawn<const DOMAINSIZE: usize>(
-        &self,
-        connecting_tiles: &[Option<Rc<Tile<DOMAINSIZE>>>],
-        atlas: &HashMap<Position, Rc<Tile<DOMAINSIZE>>>,
-        recursion_level: i32,center: &Tile<DOMAINSIZE>
-
-    ) -> bool {
-        match self {
-            Self::House => House::can_spawn(connecting_tiles, atlas, recursion_level,center),
-            Self::Grass => Grass::can_spawn(connecting_tiles, atlas, recursion_level,center),
-            Self::Sand => Sand::can_spawn(connecting_tiles, atlas, recursion_level,center),
-            Self::Water => Water::can_spawn(connecting_tiles, atlas, recursion_level,center),
-            Self::DeepWater => DeepWater::can_spawn(connecting_tiles, atlas, recursion_level,center),
-            Self::Tree => Tree::can_spawn(connecting_tiles, atlas, recursion_level,center),
-            Self::BigTree => BigTree::can_spawn(connecting_tiles, atlas, recursion_level, center),
-            _ => false,
-        }
-    }
-
-    fn get_base_weight(&self) -> f32 {
-        match self {
-            Self::House => 0.1,
-            Self::Water => 0.5,
-            Self::Tree => 0.5,
-            Self::Sand => 10.0,
-            Self::DeepWater => 0.1,
-            Self::BigTree => 0.1,
-            Self::Grass => 0.5,
-            _ => 1.0,
-        }
-    }
-
-    fn init_domain_weights() -> HashMap<Self, f32> {
-        let mut domain = HashMap::new();
-        for tile in Self::DEFAULT_DOMAINS {
-            domain.insert(tile, tile.get_base_weight()); //ToDo: replace magic number with get_weight function
-        }
-        domain
     }
 }
